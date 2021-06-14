@@ -11,6 +11,9 @@ from scipy import sparse as sp
 from scipy.sparse import issparse, csr_matrix
 from sklearn.utils import check_random_state
 
+# This is used in order to recognize persistent blocks
+from storage.api import StorageObject
+
 
 class Array(object):
     """ A distributed 2-dimensional array divided in blocks.
@@ -272,6 +275,11 @@ class Array(object):
         """
         sparse = None
         b0 = blocks[0][0]
+
+        # If block is persistent, then retrieve the actual content
+        if isinstance(b0, StorageObject):
+            b0 = b0.block_data
+
         if sparse is None:
             sparse = issparse(b0)
 
@@ -1455,12 +1463,15 @@ def _block_apply_axis(func, axis, blocks, *args, **kwargs):
 
 @task(returns=1)
 def _block_apply(func, block, *args, **kwargs):
-    return func(block, *args, **kwargs)
+    if isinstance(block, StorageObject):
+        return block.block_apply(func, args, kwargs)
+    else:
+        return func(block, *args, **kwargs)
 
 
 @task(block=INOUT)
 def _set_value(block, i, j, value):
-    block[i][j] = value
+    block[i,j] = value
 
 
 @task(blocks={Type: COLLECTION_IN, Depth: 1}, returns=1)
