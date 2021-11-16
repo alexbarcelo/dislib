@@ -1,6 +1,8 @@
 import json
 import os
 import pickle
+import time
+
 from uuid import uuid4
 
 import numpy as np
@@ -111,6 +113,12 @@ class CascadeSVM(BaseEstimator):
         self.check_convergence = check_convergence
         self.random_state = random_state
         self.verbose = verbose
+        self._split_overhead = -1
+
+        import os
+        from distutils.util import strtobool
+        self._use_split = strtobool(os.environ.get("USE_SPLIT", "True"))
+
 
     def fit(self, x, y):
         """ Fits a model using training data.
@@ -131,8 +139,16 @@ class CascadeSVM(BaseEstimator):
         self._set_gamma(x.shape[1])
         self._set_kernel()
         self._hstack_f = hstack_sp if x._sparse else np.hstack
+        
+        ids_list = [[_gen_ids(row.shape[0])] for row in x._iterator(axis=0)]
+
+        # Ugly, but the split don't like to receive Future objects because
+        # compss_wait_on cannot be called multiple times on a same object
+        x._blocks = compss_wait_on(x._blocks)
+        y._blocks = compss_wait_on(y._blocks)
 
         ids_list = [[_gen_ids(row.shape[0])] for row in x._iterator(axis=0)]
+        self._split_overhead = 0
 
         while not self._check_finished():
             self._do_iteration(x, y, ids_list)
@@ -140,6 +156,9 @@ class CascadeSVM(BaseEstimator):
             if self.check_convergence:
                 self._check_convergence_and_update_w()
                 self._print_iteration()
+
+        from tad4bj.slurm import handler as tadh
+        tadh["split_overhead_time"] = self._split_overhead
 
         return self
 
@@ -285,10 +304,39 @@ class CascadeSVM(BaseEstimator):
         arity = self.cascade_arity
 
         # first level
-        for partition, id_bk in zip(_paired_partition(x, y), ids_list):
-            x_data = partition[0]._blocks
-            y_data = partition[1]._blocks
-            ids = [id_bk]
+        elapsed_t = 0
+        timer_t = time.time()
+
+        if self._use_split:
+
+            # prepare split structures
+            # dislib code seemed to be too convoluted for my taste.
+            # So I will be abusing the fact that the partition
+            # is following the x rows, and focusing on y
+            _, partitioned_y = zip(*_paired_partition(x, y))
+            partitioned_y = list(partitioned_y)
+
+            # TODO: address the split_by_rows vs split
+            from dataclay.contrib.splitting import split
+            from dislib_model.split import GenericSplit
+
+            thing_to_iter = split(x._blocks, split_class=GenericSplit)
+        else:
+            thing_to_iter = zip(_paired_partition(x, y), ids_list)
+
+        for iter_item in thing_to_iter:
+            if self._use_split:
+                split_indexes = iter_item.get_indexes()
+                x_data = iter_item._chunks
+                y_data = [partitioned_y[idx]._blocks[0] for idx in split_indexes]
+                ids = [ids_list[idx] for idx in split_indexes]
+            else:
+                partition, id_bk = iter_item
+                x_data = partition[0]._blocks
+                y_data = partition[1]._blocks
+                ids = [id_bk]
+
+            elapsed_t += time.time() - timer_t
 
             if self._svs is not None:
                 x_data.append(self._svs)
@@ -298,6 +346,10 @@ class CascadeSVM(BaseEstimator):
             _tmp = _train(x_data, y_data, ids, self.random_state, **pars)
             sv, sv_labels, sv_ids, self._clf = _tmp
             q.append((sv, sv_labels, sv_ids))
+
+            timer_t = time.time()
+
+        self._split_overhead += elapsed_t
 
         # reduction
         while len(q) > arity:

@@ -1,13 +1,13 @@
 import itertools
 
 import numpy as np
-from pycompss.api.api import compss_delete_object, compss_wait_on
+from pycompss.api.api import compss_delete_object, compss_wait_on, compss_barrier
 from pycompss.api.constraint import constraint
 from pycompss.api.parameter import COLLECTION_OUT, Type, Depth, \
-    COLLECTION_INOUT, COLLECTION_IN
+    COLLECTION_INOUT, COLLECTION_IN, INOUT
 from pycompss.api.task import task
 
-from dislib.data.array import Array, identity
+from dislib.data.array import Array, identity, identity_by_cols
 
 
 def kron(a, b, block_size=None):
@@ -85,7 +85,7 @@ def kron(a, b, block_size=None):
         return out
 
 
-def svd(a, compute_uv=True, sort=True, copy=True, eps=1e-9):
+def svd(a, compute_uv=True, sort=True, copy=True, eps=1e-9, max_iterations=-1):
     """ Performs singular value decomposition of a ds-array via the one-sided
     block Jacobi algorithm described in Arbenz and Slapnicar [1]_ and
     Dongarra et al. [2]_.
@@ -164,10 +164,23 @@ def svd(a, compute_uv=True, sort=True, copy=True, eps=1e-9):
         x = a
 
     if compute_uv:
-        v = identity(x.shape[1], (x._reg_shape[1], x._reg_shape[1]))
+        v = identity_by_cols(x.shape[1], (x._reg_shape[1], x._reg_shape[1]))
 
     checks = [True]
 
+    from dislib_model.block import PersistentBlock
+    from dataclay.api import get_backends_info
+    backends = get_backends_info().keys()
+
+    x.collect()
+    columns = list()
+    for i, backend in zip(range(x._n_blocks[1]), itertools.cycle(backends)):
+        # TODO: Design a better way of doing this. Otherwise, master is busy doing silly stuff and aggregating all the data
+        col_blocks = [[x._blocks[j][i]] for j in range(x._n_blocks[0])]
+        b = PersistentBlock(Array._merge_blocks(col_blocks))
+        b.make_persistent(backend_id=backend)
+        columns.append(b)
+    
     while not _check_convergence_svd(checks):
         checks = []
 
@@ -179,27 +192,30 @@ def svd(a, compute_uv=True, sort=True, copy=True, eps=1e-9):
             coli_x = x._get_col_block(i)
             colj_x = x._get_col_block(j)
 
-            rot, check = _compute_rotation_and_rotate(
-                coli_x._blocks, colj_x._blocks, eps
+            rot, check = col_i._compute_rotation_and_rotate(
+                col_j, eps
             )
             checks.append(check)
 
-            if compute_uv:
-                coli_v = v._get_col_block(i)
-                colj_v = v._get_col_block(j)
-                _rotate(coli_v._blocks, colj_v._blocks, rot)
+            if compute_uv and rot is not None:
+                v[i]._rotate_with(v[j], rot)
 
-    s = x.norm(axis=0)
+    s_blocks = [col.norm(axis=0) for col in columns]
+    # The following constructor could be a little bit more aesthetic for my taste
+    s = PersistentBlock(np.block(compss_wait_on(s_blocks)))
+    s.make_persistent()
 
     if sort:
-        sorting = _sort_s(s._blocks)
+        sorting = _sort_s(s)
 
     if compute_uv:
+
         if sort:
+            raise NotImplementedError("Not done yet under dataClay integration. Set sort=False for now.")
             u = _compute_u_sorted(x, sorting)
             v = _sort_v(v, sorting)
         else:
-            u = _compute_u(x)
+            u = _compute_u(columns)
 
         return u, s, v
     else:
@@ -214,17 +230,13 @@ def _check_convergence_svd(checks):
     return True
 
 
-def _compute_u(a):
-    u_blocks = [[] for _ in range(a._n_blocks[0])]
+def _compute_u(a_cols):
+    u_blocks = []
 
-    for vblock in a._iterator("columns"):
-        u_block = [object() for _ in range(vblock._n_blocks[0])]
-        _compute_u_block(vblock._blocks, u_block)
+    for col in a_cols:
+        u_blocks.append(col._compute_u_block())
 
-        for i in range(len(u_block)):
-            u_blocks[i].append(u_block[i])
-
-    return Array(u_blocks, a._top_left_shape, a._reg_shape, a.shape, a._sparse)
+    return u_blocks
 
 
 def _compute_u_sorted(a, sorting):
@@ -284,38 +296,14 @@ def _sort_v(v, sorting):
 
 
 @constraint(computing_units="${ComputingUnits}")
-@task(s_blocks={Type: COLLECTION_INOUT, Depth: 2}, returns=1)
-def _sort_s(s_blocks):
-    s = Array._merge_blocks(s_blocks)
+@task(s_block=INOUT, returns=1)
+def _sort_s(s_block):
+    s = s_block.block_data
 
-    sorting = np.argsort(s[0])[::-1]
-    s_sorted = s[0][sorting]
-    bsize = s_blocks[0][0].shape[1]
-
-    for i in range(len(s_blocks[0])):
-        s_blocks[0][i] = s_sorted[i * bsize:(i + 1) * bsize].reshape(1, -1)
+    sorting = np.argsort(s)[::-1]
+    s_block.block_data = s[0][sorting]
 
     return sorting
-
-
-@constraint(computing_units="${ComputingUnits}")
-@task(a_block={Type: COLLECTION_IN, Depth: 2},
-      u_block={Type: COLLECTION_OUT, Depth: 1})
-def _compute_u_block(a_block, u_block):
-    a_col = Array._merge_blocks(a_block)
-    norm = np.linalg.norm(a_col, axis=0)
-
-    # replace zero norm columns of a with an arbitrary unitary vector
-    zero_idx = np.where(norm == 0)
-    a_col[0, zero_idx] = 1
-    norm[zero_idx] = 1
-
-    u_col = a_col / norm
-
-    block_size = a_block[0][0].shape[0]
-
-    for i in range(len(u_block)):
-        u_block[i] = u_col[i * block_size: (i + 1) * block_size]
 
 
 @constraint(computing_units="${ComputingUnits}")

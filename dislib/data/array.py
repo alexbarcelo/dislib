@@ -1239,6 +1239,31 @@ def identity(n, block_size, dtype=None):
     return eye(n, n, block_size, dtype)
 
 
+def identity_by_cols(n, block_size, dtype=None):
+    """Returns an identity matrix, but use column based blocking.
+    
+    Blocksize information is only used for column wide. Number of rows will
+    be n (total size of the output matrix).
+
+    This return a list of PersistentBlock, each of those being a "column"-block.
+    """
+    n_cols = (int(ceil(n / block_size[1])))
+
+    from dislib_model.block import PersistentBlock
+    from dataclay.api import get_backends_info
+    import itertools
+    backends = get_backends_info().keys()
+
+    cols = list()
+
+    for i, backend in zip(range(n_cols), itertools.cycle(backends)):
+        b = PersistentBlock(np.eye(n, block_size[1], -i * block_size[1]))
+        b.make_persistent(backend_id=backend)
+        cols.append(b)
+
+    return cols
+
+
 def eye(n, m, block_size, dtype=None):
     """ Returns a matrix filled with ones on the diagonal and zeros elsewhere.
 
@@ -1932,7 +1957,6 @@ def _block_apply(func, block, *args, **kwargs):
 @constraint(computing_units="${ComputingUnits}")
 @task(block=INOUT)
 def _set_value(block, i, j, value):
-<<<<<<< HEAD
     block[i, j] = value
 
 
@@ -1940,9 +1964,6 @@ def _set_value(block, i, j, value):
 @task(block=INOUT)
 def _block_set_slice(block, i: tuple, j: tuple, value_array):
     block[i[0]:i[1], j[0]:j[1]] = value_array
-=======
-    block[i,j] = value
->>>>>>> Minimal changes to the Array to support dataClay persistent blocks.
 
 
 @constraint(computing_units="${ComputingUnits}")
