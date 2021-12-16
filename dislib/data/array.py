@@ -109,16 +109,20 @@ class Array(object):
         n_blocks = (self._n_blocks[0], x._n_blocks[1])
         blocks = Array._get_out_blocks(n_blocks)
 
+        shape = (self.shape[0], x.shape[1])
+        tl_shape = (self._top_left_shape[0], x._top_left_shape[1])
+        reg_shape = (self._reg_shape[0], x._reg_shape[1])
+
         for i in range(n_blocks[0]):
             for j in range(n_blocks[1]):
                 hblock = self._blocks[i]
                 vblock = [x._blocks[k][j] for k in range(len(x._blocks))]
 
-                blocks[i][j] = _multiply_block_groups(hblock, vblock)
+                blocks[i][j] = _multiply_block_groups(hblock, vblock, tl_shape)
 
-        shape = (self.shape[0], x.shape[1])
-        tl_shape = (self._top_left_shape[0], x._top_left_shape[1])
-        reg_shape = (self._reg_shape[0], x._reg_shape[1])
+        # To address stuff going with the dummy_inout_antiversions on _multiply_block_groups
+        from pycompss.api.api import compss_barrier
+        compss_barrier()
 
         return Array(blocks=blocks, top_left_shape=tl_shape,
                      reg_shape=reg_shape, shape=shape, sparse=self._sparse)
@@ -879,7 +883,6 @@ class Array(object):
             out_blocks = []
             for r in self._iterator(axis=0):
                 _blocks = self._get_out_blocks(r._n_blocks)
-
                 _transpose(r._blocks, _blocks)
 
                 out_blocks.append(_blocks[0])
@@ -1115,7 +1118,7 @@ class Array(object):
         compss_delete_object(ref)
 
 
-def array(x, block_size):
+def array(x, block_size, persist_blocks=False):
     """
     Loads data into a Distributed Array.
 
@@ -1125,6 +1128,8 @@ def array(x, block_size):
         Array of samples.
     block_size : (int, int)
         Block sizes in number of samples.
+    persist_blocks : bool
+        Make the blocks persistent (through dataClay PersistentStorage)
 
     Returns
     -------
@@ -1155,9 +1160,18 @@ def array(x, block_size):
 
     bn, bm = block_size
 
+    from dislib_model.block import PersistentBlock
     blocks = []
     for i in range(0, x.shape[0], bn):
-        row = [x[i: i + bn, j: j + bm] for j in range(0, x.shape[1], bm)]
+        row = list()
+        for j in range(0, x.shape[1], bm):
+            block_data = x[i: i + bn, j: j + bm]
+            if persist_blocks:
+                b = PersistentBlock(block_data)
+                b.make_persistent()
+                row.append(b)
+            else:
+                row.append(block_data)
         blocks.append(row)
 
     sparse = issparse(x)
@@ -1525,15 +1539,18 @@ def _multiply_block_groups(hblock, vblock, transpose_a=False,
                          transpose_a, transpose_b)
         )
 
-    while len(blocks) > 1:
-        block1 = blocks.popleft()
-        block2 = blocks.popleft()
-        blocks.append(_block_apply(operator.add, block1, block2))
+    result_block_data = np.zeros(block_shape)
+    result_block = PersistentBlock(result_block_data)
+    result_block.make_persistent()
+    
+    dummy_inout_antiversions = 42
 
-        compss_delete_object(block1)
-        compss_delete_object(block2)
+    for blocki, blockj in zip(hblock, vblock):
+        # I hate useless versions, maybe they are not responsible of performance degradation,
+        # but it is a pain to check and this ugly workaround should work flawlessly
+        dummy_inout_antiversions = result_block.fused_multiply_add(blocki, blockj, dummy_inout_antiversions)
 
-    return blocks[0]
+    return result_block
 
 
 def matsubtract(a: Array, b: Array):
@@ -1894,15 +1911,23 @@ def _transpose(blocks, out_blocks):
 
 
 @constraint(computing_units="${ComputingUnits}")
-@task(returns=np.array)
+@task(returns=1)
 def _random_block(shape, seed):
+    from dislib_model.block import PersistentBlock
+
     np.random.seed(seed)
-    return np.random.random(shape)
+    block = np.random.random(shape)
+    b = PersistentBlock(block)
+    b.make_persistent()
+    
+    return b
 
 
 @constraint(computing_units="${ComputingUnits}")
 @task(returns=1)
 def _eye_block(block_size, n, m, reg_shape, i, j, dtype):
+    from dislib_model.block import PersistentBlock
+
     block = np.zeros(block_size, dtype)
 
     i_values = np.arange(i * reg_shape[0], min(n, (i + 1) * reg_shape[0]))
@@ -1914,7 +1939,10 @@ def _eye_block(block_size, n, m, reg_shape, i, j, dtype):
     j_ones = indices - (j * reg_shape[1])
 
     block[i_ones, j_ones] = 1
-    return block
+
+    b = PersistentBlock(block)
+    b.make_persistent()
+    return b
 
 
 @constraint(computing_units="${ComputingUnits}")
