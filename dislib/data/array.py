@@ -1225,7 +1225,7 @@ def random_array(shape, block_size, random_state=None):
         Distributed array of random floats.
     """
     r_state = check_random_state(random_state)
-    return _full(shape, block_size, False, _random_block_wrapper, r_state)
+    return _full(shape, block_size, False, DCRoundRobinRandomBlockWrapper(), r_state)
 
 
 def identity(n, block_size, dtype=None):
@@ -1827,6 +1827,19 @@ def _random_block_wrapper(block_size, r_state):
     return _random_block(block_size, seed)
 
 
+class DCRoundRobinRandomBlockWrapper:
+    """Create random blocks, and store them in RoundRobin fashion on dataClay."""
+    def __init__(self):
+        from itertools import cycle
+        from dataclay.api import get_backends_info
+
+        self.backend_iterator = cycle(list(get_backends_info().keys()))
+    
+    def __call__(self, block_size, r_state):
+        seed = r_state.randint(np.iinfo(np.int32).max)
+        return _random_persistent_block(block_size, seed, next(self.backend_iterator))
+
+
 @constraint(computing_units="${ComputingUnits}")
 @task(returns=1)
 def _get_item(i, j, block):
@@ -1913,12 +1926,26 @@ def _transpose(blocks, out_blocks):
 @constraint(computing_units="${ComputingUnits}")
 @task(returns=1)
 def _random_block(shape, seed):
+    """DEPRECATED! Rollback to regular non-dataClay version, or remove, or whatever."""
     from dislib_model.block import PersistentBlock
 
     np.random.seed(seed)
     block = np.random.random(shape)
     b = PersistentBlock(block)
     b.make_persistent()
+    
+    return b
+
+
+@constraint(computing_units="${ComputingUnits}")
+@task(returns=1)
+def _random_persistent_block(shape, seed, backend_id):
+    from dislib_model.block import PersistentBlock
+
+    np.random.seed(seed)
+    block = np.random.random(shape)
+    b = PersistentBlock(block)
+    b.make_persistent(backend_id=backend_id)
     
     return b
 
