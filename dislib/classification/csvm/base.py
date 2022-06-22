@@ -320,7 +320,7 @@ class CascadeSVM(BaseEstimator):
             from dataclay.contrib.splitting import split
             from dislib_model.split import GenericSplit
 
-            thing_to_iter = split(x._blocks, split_class=GenericSplit)
+            thing_to_iter = split(x._blocks, split_class=GenericSplit, multiplicity=24)
         else:
             thing_to_iter = zip(_paired_partition(x, y), ids_list)
 
